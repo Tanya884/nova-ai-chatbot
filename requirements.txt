@@ -1,0 +1,9 @@
+streamlit
+ollama
+pandas
+openpyxl
+pypdf
+python-docx
+ddgs
+requests
+reportlab
