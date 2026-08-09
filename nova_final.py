@@ -11,7 +11,7 @@ import html
 import threading
 import time
 import uuid
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from datetime import datetime
 from pathlib import Path
 
@@ -44,6 +44,7 @@ def get_secret(name):
 
 GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
 OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY")
+POLLINATIONS_API_KEY = get_secret("POLLINATIONS_API_KEY")
 CLOUD_MODE = bool(GEMINI_API_KEY or OPENROUTER_API_KEY)
 
 # A public Streamlit deployment must not share one SQLite file between users.
@@ -1047,6 +1048,7 @@ def needs_web_search(query):
         "price", "weather", "stock", "share price", "score", "result",
         "schedule", "election", "president", "prime minister", "ceo",
         "salary", "package", "hike", "vacancy", "job opening", "release",
+        "career", "careers", "jobs page", "career page", "job listing",
         "version", "law", "rule", "policy", "rate", "exchange rate",
         "market", "search internet", "search web", "on internet",
         "google", "online", "website", "download", "csv", "xlsx",
@@ -1245,9 +1247,83 @@ def wants_images(query):
     image_terms = [
         " image ", " images ", " pic ", " pics ", " picture ",
         " pictures ", " photo ", " photos ", " wallpaper ",
+        " poster ", " logo ", " artwork ", " art ",
         " tasveer ", " tasveeren ", " photo dikhao ", " pics dikhao ",
     ]
     return any(term in q for term in image_terms)
+
+
+def wants_image_generation(query):
+    """Separate AI creation from ordinary web image search."""
+    q = query.lower()
+    image_word = any(term in q for term in [
+        "image", "picture", "photo", "pic", "wallpaper", "poster",
+        "logo", "art", "tasveer",
+    ])
+    creation_word = any(term in q for term in [
+        "generate", "create", "make", "draw", "design", "banao",
+        "bana do", "bnao", "bnado", "generate karo", "create karo",
+    ])
+    return image_word and creation_word
+
+
+def wants_image_search(query):
+    """Use web photos only when the user clearly asks for real/search results."""
+    q = query.lower()
+    return any(term in q for term in [
+        "search", "find", "from web", "from google", "google se",
+        "real photo", "real image", "actual photo", "latest photo",
+        "current photo", "news photo", "photos dikhao", "pics dikhao",
+        "photo dikhao", "images dikhao",
+    ])
+
+
+def requests_broad_scope(query):
+    """Detect when the latest question intentionally drops an old filter."""
+    q = query.lower()
+    return any(term in q for term in [
+        "all positions", "all jobs", "all companies", "every company",
+        "any company", "overall", "in general", "generally",
+        "jitni bhi", "sabhi position", "sab position", "sb position",
+        "sab dikhao", "sb dikhao", "saari position", "sari position",
+    ])
+
+
+def generate_ai_image(query):
+    """Generate and cache an image using Pollinations' image endpoint."""
+    import requests
+
+    prompt = re.sub(
+        r"\b(?:please|generate|create|make|draw|design|banao|bana\s+do|"
+        r"bnao|bnado|karo|an?|the|image|picture|photo|pic)\b",
+        " ",
+        query,
+        flags=re.I,
+    )
+    prompt = re.sub(r"\s+", " ", prompt).strip() or query.strip()
+    seed = int(hashlib.sha256(query.encode("utf-8")).hexdigest()[:8], 16)
+    url = "https://gen.pollinations.ai/image/" + quote(prompt, safe="")
+    params = {
+        "width": 1024,
+        "height": 1024,
+        "seed": seed,
+        "nologo": "true",
+    }
+    if POLLINATIONS_API_KEY:
+        params["key"] = POLLINATIONS_API_KEY
+
+    response = requests.get(url, params=params, timeout=(20, 240))
+    response.raise_for_status()
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "image" not in content_type or len(response.content) < 5000:
+        raise RuntimeError("The image service did not return a valid image.")
+
+    session_id = st.session_state.get("nova_session_id", "local")
+    image_path = os.path.join(
+        "/tmp", f"nova_generated_{session_id}_{uuid.uuid4().hex}.jpg"
+    )
+    Path(image_path).write_bytes(response.content)
+    return prompt, image_path
 
 
 def image_search(query, max_results=6):
@@ -1286,11 +1362,18 @@ def image_search(query, max_results=6):
 
 
 IMAGE_RESULT_PREFIX = "[[NOVA_IMAGE_RESULTS]]"
+GENERATED_IMAGE_PREFIX = "[[NOVA_GENERATED_IMAGE]]"
 
 
 def pack_image_results(query, images):
     return IMAGE_RESULT_PREFIX + json.dumps(
         {"query": query, "images": images}, ensure_ascii=False
+    )
+
+
+def pack_generated_image(prompt, image_path):
+    return GENERATED_IMAGE_PREFIX + json.dumps(
+        {"prompt": prompt, "path": image_path}, ensure_ascii=False
     )
 
 
@@ -1310,6 +1393,30 @@ def repair_mojibake(value):
 def render_chat_content(content):
     """Render normal messages or a persistent grid of image-search results."""
     content = repair_mojibake(content)
+    if content.startswith(GENERATED_IMAGE_PREFIX):
+        try:
+            payload = json.loads(content[len(GENERATED_IMAGE_PREFIX):])
+            image_path = payload["path"]
+            st.markdown(
+                f"Generated image for **{payload.get('prompt', 'your prompt')}**:"
+            )
+            if os.path.exists(image_path):
+                st.image(image_path, use_container_width=True)
+                st.download_button(
+                    "⬇️ Download image",
+                    data=Path(image_path).read_bytes(),
+                    file_name="Nova_Generated_Image.jpg",
+                    mime="image/jpeg",
+                    key="generated_" + hashlib.md5(
+                        image_path.encode("utf-8")
+                    ).hexdigest(),
+                )
+            else:
+                st.info("This temporary generated image has expired. Generate it again.")
+        except Exception:
+            st.warning("The generated image could not be displayed.")
+        return
+
     if not content.startswith(IMAGE_RESULT_PREFIX):
         if "\n\n📎 " in content:
             body, attached = content.rsplit("\n\n📎 ", 1)
@@ -1786,8 +1893,6 @@ components.html(
         previous.cleanup();
       }
 
-      const scroller = d.querySelector('[data-testid="stMain"]') ||
-                       d.scrollingElement || d.documentElement;
       const button = d.createElement('button');
       button.id = 'nova-jump-latest';
       button.type = 'button';
@@ -1820,22 +1925,92 @@ components.html(
       };
       placeButton();
 
-      const distanceFromBottom = () =>
-        Math.max(0, scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight);
+      const scrollTargets = () => Array.from(new Set([
+        d.querySelector('[data-testid="stMain"]'),
+        d.querySelector('[data-testid="stAppViewContainer"]'),
+        d.scrollingElement,
+        d.documentElement,
+        d.body
+      ].filter(Boolean)));
+
+      const activeScroller = () => {
+        const targets = scrollTargets();
+        const movedTargets = targets.filter((target) => target.scrollTop > 0);
+        const candidates = movedTargets.length ? movedTargets : targets;
+        return candidates.sort((a, b) =>
+          (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight)
+        )[0] || d.documentElement;
+      };
+
+      const distanceFromBottom = () => {
+        const target = activeScroller();
+        const pageDistance = Math.max(
+          0,
+          Math.max(d.body.scrollHeight, d.documentElement.scrollHeight)
+            - (w.scrollY + w.innerHeight)
+        );
+        const targetDistance = Math.max(
+          0,
+          target.scrollHeight - target.scrollTop - target.clientHeight
+        );
+        return Math.max(pageDistance, targetDistance);
+      };
+
+      const hideStreamlitOwnerChrome = () => {
+        d.querySelectorAll(
+          '[data-testid="stAppDeployButton"], [class*="viewerBadge"], '
+          + '[class*="ViewerBadge"]'
+        ).forEach((node) => node.style.setProperty('display', 'none', 'important'));
+
+        // Community Cloud injects this owner-only control outside Nova's
+        // normal Streamlit component tree, so ordinary CSS selectors vary by
+        // release. Match its exact visible label and hide its clickable shell.
+        d.querySelectorAll('button, a, [role="button"], div').forEach((node) => {
+          if ((node.textContent || '').trim() !== 'Manage app') return;
+          const shell = node.closest('button, a, [role="button"]') || node;
+          shell.style.setProperty('display', 'none', 'important');
+          let parent = shell.parentElement;
+          for (let depth = 0; parent && depth < 5; depth += 1) {
+            if (w.getComputedStyle(parent).position === 'fixed') {
+              parent.style.setProperty('display', 'none', 'important');
+              break;
+            }
+            parent = parent.parentElement;
+          }
+        });
+      };
 
       const refresh = () => {
+        hideStreamlitOwnerChrome();
+        d.querySelectorAll('[data-testid="stChatMessageContent"] a').forEach((link) => {
+          link.setAttribute('target', '_blank');
+          link.setAttribute('rel', 'noopener noreferrer');
+        });
         const hasConversation = d.querySelectorAll('[data-testid="stChatMessage"]').length > 0;
         button.style.display = hasConversation && distanceFromBottom() > 180
           ? 'block' : 'none';
       };
 
       const jump = () => {
-        scroller.scrollTo({top: scroller.scrollHeight, behavior: 'smooth'});
+        const composer = d.querySelector('[data-testid="stChatInput"]');
+        if (composer) {
+          composer.scrollIntoView({behavior: 'smooth', block: 'end'});
+        }
+        scrollTargets().forEach((target) => {
+          if (typeof target.scrollTo === 'function') {
+            target.scrollTo({top: target.scrollHeight, behavior: 'smooth'});
+          }
+        });
+        w.scrollTo({top: Math.max(d.body.scrollHeight, d.documentElement.scrollHeight), behavior: 'smooth'});
         w.setTimeout(refresh, 350);
       };
 
       button.addEventListener('click', jump);
-      scroller.addEventListener('scroll', refresh, {passive: true});
+      const listenedTargets = scrollTargets();
+      listenedTargets.forEach((target) =>
+        target.addEventListener('scroll', refresh, {passive: true})
+      );
+      w.addEventListener('scroll', refresh, {passive: true});
       mobile.addEventListener('change', placeButton);
       const observer = new MutationObserver(refresh);
       observer.observe(d.body, {childList: true, subtree: true, characterData: true});
@@ -1845,7 +2020,10 @@ components.html(
       w.__novaJumpToLatest = {
         cleanup: () => {
           observer.disconnect();
-          scroller.removeEventListener('scroll', refresh);
+          listenedTargets.forEach((target) =>
+            target.removeEventListener('scroll', refresh)
+          );
+          w.removeEventListener('scroll', refresh);
           mobile.removeEventListener('change', placeButton);
           button.remove();
         }
@@ -2005,13 +2183,26 @@ if prompt:
                 unsafe_allow_html=True,
             )
 
-    # Image requests are a tool action, not a question for the language model.
-    # Search and render actual pictures immediately and persist them in history.
+    # Image requests are tool actions, not questions for the text model. Nova
+    # generates new artwork for creation prompts and searches the web only for
+    # requests that ask for existing pictures.
     if wants_images(prompt):
         with st.chat_message("assistant"):
             if not use_internet:
-                answer = "Please turn on the Internet toggle to search for pictures."
+                answer = "Please turn on the Internet toggle to use images."
                 st.info(answer)
+            elif wants_image_generation(prompt) or not wants_image_search(prompt):
+                try:
+                    with st.spinner("Generating your image..."):
+                        image_prompt, image_path = generate_ai_image(prompt)
+                    answer = pack_generated_image(image_prompt, image_path)
+                    render_chat_content(answer)
+                except Exception as e:
+                    answer = (
+                        "Image generation is temporarily unavailable. Please "
+                        f"try again shortly. ({html.escape(str(e))[:180]})"
+                    )
+                    st.error(answer)
             else:
                 try:
                     with st.spinner("Finding pictures..."):
@@ -2161,6 +2352,12 @@ Rules:
   for genuine comparisons. Do not over-format a simple one-line answer.
 - Never leave an incomplete bullet, sentence, heading or section.
 - Remember the conversation context provided below.
+- Treat the newest user message as the controlling request. Never silently
+  carry a company, location, date, role or other filter from an older message
+  when the newest message asks generally, broadly, for all, or changes topic.
+- In particular, an earlier discussion about Amex does not mean every later
+  Data Analyst or career question is about Amex. Retain Amex only when the
+  newest message explicitly says Amex or clearly refers back to that company.
 - If a file is uploaded, use the file as the primary source.
 - Never invent values that are not present in the uploaded file.
 - For Excel/CSV questions, reason from the supplied data.
@@ -2176,6 +2373,11 @@ Rules:
 - If fresh results are insufficient, say only what could not be verified; do
   not present the model cutoff as a weakness.
 - Do not claim to have browsed unless WEB SEARCH RESULTS are actually supplied.
+- Every external Markdown link must use a URL copied exactly from supplied WEB
+  SEARCH RESULTS. Never guess, shorten, reconstruct or invent a careers URL.
+- If the user reports that a link does not open, use fresh search results and
+  provide the best verified direct link instead of speculating about cookies,
+  ad blockers or regional redirects.
 - If DOWNLOADED FILE CONTENT is supplied, the application has already downloaded and read the file. Analyze it directly.
 - Do not claim that you cannot download files when DOWNLOAD STATUS is supplied.
 - Never invent values that are not present in supplied file data.
@@ -2407,6 +2609,10 @@ FACT-CHECKING REQUIREMENT:
     # PDF generation needs the uploaded source and current request, not the
     # entire chat history. This greatly reduces prompt-processing time.
     if pdf_mode == "content":
+        window_messages = st.session_state.messages[-1:]
+    elif requests_broad_scope(prompt):
+        # "All positions/companies" deliberately removes an earlier company
+        # filter (for example Amex), so isolate the current request.
         window_messages = st.session_state.messages[-1:]
     else:
         window_messages = st.session_state.messages[-WINDOW_MEMORY:]
