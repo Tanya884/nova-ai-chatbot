@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import ollama
 import io
 import json
@@ -8,6 +9,7 @@ import hashlib
 import re
 import html
 import threading
+import time
 import uuid
 from urllib.parse import urlparse
 from datetime import datetime
@@ -1058,6 +1060,99 @@ def needs_web_search(query):
     return any(x in q for x in keywords)
 
 
+def wants_weather(query):
+    q = query.lower()
+    return any(term in q for term in [
+        "weather", "temperature", "forecast", "mausam", "tapman",
+        "बारिश", "मौसम", "तापमान",
+    ])
+
+
+def extract_weather_location(query):
+    """Extract a likely city/place from English or Hinglish weather prompts."""
+    cleaned = str(query)
+    cleaned = re.sub(r"([A-Za-z]+)['’]s\b", r"\1", cleaned)
+    patterns = [
+        r"\b(?:please|pls|current|live|today(?:'s)?|now|update|tell me|show)\b",
+        r"\b(?:weather|temperature|forecast|mausam|tapman|degree|degrees)\b",
+        r"\b(?:in|for|of|ka|ki|k|the|is|what|whats|please)\b",
+    ]
+    for pattern in patterns:
+        cleaned = re.sub(pattern, " ", cleaned, flags=re.I)
+    cleaned = re.sub(r"[^\w\s\-]", " ", cleaned, flags=re.UNICODE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or str(query).strip()
+
+
+def get_live_weather(query):
+    """Return current conditions without consuming any LLM quota."""
+    import requests
+
+    location = extract_weather_location(query)
+    geo_response = requests.get(
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params={"name": location, "count": 1, "language": "en", "format": "json"},
+        timeout=12,
+    )
+    geo_response.raise_for_status()
+    places = geo_response.json().get("results") or []
+    if not places:
+        raise RuntimeError(f"I couldn't find the location '{location}'.")
+
+    place = places[0]
+    weather_response = requests.get(
+        "https://api.open-meteo.com/v1/forecast",
+        params={
+            "latitude": place["latitude"],
+            "longitude": place["longitude"],
+            "current": (
+                "temperature_2m,apparent_temperature,relative_humidity_2m,"
+                "precipitation,weather_code,wind_speed_10m"
+            ),
+            "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+            "timezone": "auto",
+            "forecast_days": 1,
+        },
+        timeout=12,
+    )
+    weather_response.raise_for_status()
+    data = weather_response.json()
+    current = data.get("current") or {}
+    daily = data.get("daily") or {}
+
+    weather_codes = {
+        0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+        45: "Fog", 48: "Rime fog", 51: "Light drizzle", 53: "Drizzle",
+        55: "Heavy drizzle", 61: "Light rain", 63: "Rain", 65: "Heavy rain",
+        71: "Light snow", 73: "Snow", 75: "Heavy snow", 80: "Rain showers",
+        81: "Rain showers", 82: "Heavy rain showers", 95: "Thunderstorm",
+        96: "Thunderstorm with hail", 99: "Heavy thunderstorm with hail",
+    }
+    code = int(current.get("weather_code", -1))
+    condition = weather_codes.get(code, "Current conditions")
+    place_name = place.get("name", location)
+    region = place.get("admin1") or place.get("country") or ""
+    full_place = f"{place_name}, {region}" if region else place_name
+
+    def first(values, default="N/A"):
+        return values[0] if isinstance(values, list) and values else default
+
+    return (
+        f"### Weather in {full_place}\n\n"
+        f"- **Current temperature:** {current.get('temperature_2m', 'N/A')}°C\n"
+        f"- **Feels like:** {current.get('apparent_temperature', 'N/A')}°C\n"
+        f"- **Condition:** {condition}\n"
+        f"- **Humidity:** {current.get('relative_humidity_2m', 'N/A')}%\n"
+        f"- **Wind:** {current.get('wind_speed_10m', 'N/A')} km/h\n"
+        f"- **Today's range:** {first(daily.get('temperature_2m_min'))}°C to "
+        f"{first(daily.get('temperature_2m_max'))}°C\n"
+        f"- **Maximum rain chance:** "
+        f"{first(daily.get('precipitation_probability_max'))}%\n\n"
+        f"*Updated {current.get('time', 'now')} local time. Weather data by "
+        f"[Open-Meteo](https://open-meteo.com/).*"
+    )
+
+
 def needs_fact_verification(query):
     """Identify numeric/public-fact questions that need authoritative sources."""
     q = query.lower()
@@ -1116,6 +1211,32 @@ def web_search(query):
         ) or "No web results found."
     except Exception as e:
         return f"Web search unavailable: {e}"
+
+
+def build_search_fallback(query, raw_results):
+    """Present useful live sources when every LLM provider is temporarily busy."""
+    if not raw_results or raw_results.startswith("Web search unavailable:"):
+        return ""
+
+    items = []
+    for block in raw_results.split("\n\n"):
+        title = re.search(r"^Title:\s*(.+)$", block, flags=re.M)
+        url = re.search(r"^URL:\s*(.+)$", block, flags=re.M)
+        summary = re.search(r"^Summary:\s*(.*)$", block, flags=re.M | re.S)
+        if not title or not url:
+            continue
+        label = title.group(1).strip()
+        href = url.group(1).strip()
+        text = summary.group(1).strip() if summary else ""
+        items.append(f"- **[{label}]({href})**\n  {text}")
+
+    if not items:
+        return ""
+    return (
+        "The AI model is temporarily busy, but I found these live results for "
+        f"**{query.strip()}**:\n\n" + "\n\n".join(items[:5])
+        + "\n\n*Open a source above to verify the exact detail.*"
+    )
 
 
 def wants_images(query):
@@ -1305,6 +1426,27 @@ OPENROUTER_MODEL_CANDIDATES = {
 }
 
 
+class ApiRequestGate:
+    """Smooth bursts from many Streamlit sessions sharing one free API key."""
+
+    def __init__(self, minimum_interval=1.1):
+        self.minimum_interval = minimum_interval
+        self.lock = threading.Lock()
+        self.last_request = 0.0
+
+    def wait_turn(self):
+        with self.lock:
+            remaining = self.minimum_interval - (time.monotonic() - self.last_request)
+            if remaining > 0:
+                time.sleep(remaining)
+            self.last_request = time.monotonic()
+
+
+@st.cache_resource(show_spinner=False)
+def get_api_request_gate():
+    return ApiRequestGate()
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_openrouter_model_ids():
     """Cache model availability so changed/deprecated IDs do not break Nova."""
@@ -1404,84 +1546,128 @@ def stream_gemini_chat(
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
     ]))
-    response = None
     errors = []
     for candidate in model_candidates:
-        response = requests.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{candidate}:streamGenerateContent?alt=sse",
-            headers={
-                "x-goog-api-key": GEMINI_API_KEY,
-                "Content-Type": "application/json",
-            },
-            json={
-                "systemInstruction": {"parts": [{"text": system_text}]},
-                "contents": contents,
-                "generationConfig": {
-                    "temperature": temperature,
-                    "maxOutputTokens": max_tokens,
+        response = None
+        for attempt in range(2):
+            get_api_request_gate().wait_turn()
+            response = requests.post(
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{candidate}:streamGenerateContent?alt=sse",
+                headers={
+                    "x-goog-api-key": GEMINI_API_KEY,
+                    "Content-Type": "application/json",
                 },
-            },
-            timeout=(15, 180),
-            stream=True,
-        )
-        if response.ok:
-            break
-        errors.append(f"{candidate}: HTTP {response.status_code}")
-        # Authentication/permission errors cannot be fixed by another model.
-        if response.status_code in (401, 403):
+                json={
+                    "systemInstruction": {"parts": [{"text": system_text}]},
+                    "contents": contents,
+                    "generationConfig": {
+                        "temperature": temperature,
+                        "maxOutputTokens": max_tokens,
+                    },
+                },
+                timeout=(15, 180),
+                stream=True,
+            )
+            if response.ok:
+                break
+
+            status = response.status_code
+            errors.append(f"{candidate}: HTTP {status}")
+            retryable = status in (429, 500, 503, 504)
+            if retryable and attempt == 0:
+                try:
+                    wait_seconds = float(response.headers.get("Retry-After", "1.5"))
+                except ValueError:
+                    wait_seconds = 1.5
+                time.sleep(min(max(wait_seconds, 0.8), 4.0))
+                continue
             break
 
-    if response is None or not response.ok:
-        detail = response.text[:350] if response is not None else "No response"
-        raise RuntimeError(
-            "Gemini request failed. " + "; ".join(errors) + f". {detail}"
-        )
+        if response is None or not response.ok:
+            # Invalid/authenticated requests will not improve by trying more
+            # models with the same key.
+            if response is not None and response.status_code in (401, 403):
+                break
+            continue
 
-    # Gemini SSE may not declare UTF-8 in Content-Type. Explicit decoding is
-    # required for Hindi and every other non-ASCII script.
-    for raw_line in response.iter_lines(decode_unicode=False):
-        if isinstance(raw_line, bytes):
-            raw_line = raw_line.decode("utf-8", errors="replace")
-        if not raw_line or not raw_line.startswith("data:"):
-            continue
-        try:
-            data = json.loads(raw_line[5:].strip())
-            parts = (
-                data.get("candidates", [{}])[0]
-                .get("content", {})
-                .get("parts", [])
-            )
-            piece = "".join(
-                part.get("text", "") for part in parts if "text" in part
-            )
-            if piece:
-                yield {"message": {"content": piece}}
-        except (json.JSONDecodeError, IndexError, TypeError):
-            continue
+        produced_text = False
+        # Gemini SSE may not declare UTF-8 in Content-Type. Explicit decoding
+        # is required for Hindi and every other non-ASCII script.
+        for raw_line in response.iter_lines(decode_unicode=False):
+            if isinstance(raw_line, bytes):
+                raw_line = raw_line.decode("utf-8", errors="replace")
+            if not raw_line or not raw_line.startswith("data:"):
+                continue
+            try:
+                data = json.loads(raw_line[5:].strip())
+                parts = (
+                    data.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [])
+                )
+                piece = "".join(
+                    part.get("text", "") for part in parts if "text" in part
+                )
+                if piece:
+                    produced_text = True
+                    yield {"message": {"content": piece}}
+            except (json.JSONDecodeError, IndexError, TypeError):
+                continue
+
+        if produced_text:
+            return
+        errors.append(f"{candidate}: empty response")
+
+    raise RuntimeError("Gemini unavailable: " + "; ".join(errors[-8:]))
 
 
 def stream_nova_chat(local_model, messages, model_options):
+    errors = []
+    max_tokens = model_options.get("num_predict", 1100)
+
     if GEMINI_API_KEY:
-        max_tokens = model_options.get("num_predict", 1100)
-        return stream_gemini_chat(
-            local_model,
-            messages,
-            max_tokens,
-            model_options.get("temperature", TEMPERATURE),
-        )
+        try:
+            produced = False
+            for chunk in stream_gemini_chat(
+                local_model,
+                messages,
+                max_tokens,
+                model_options.get("temperature", TEMPERATURE),
+            ):
+                produced = True
+                yield chunk
+            if produced:
+                return
+        except Exception as exc:
+            errors.append(f"Gemini: {exc}")
 
     if OPENROUTER_API_KEY:
-        max_tokens = model_options.get("num_predict", 1100)
-        return stream_openrouter_chat(local_model, messages, max_tokens)
+        try:
+            produced = False
+            for chunk in stream_openrouter_chat(
+                local_model, messages, max_tokens
+            ):
+                produced = True
+                yield chunk
+            if produced:
+                return
+        except Exception as exc:
+            errors.append(f"OpenRouter: {exc}")
 
-    return ollama.chat(
-        model=local_model,
-        messages=messages,
-        stream=True,
-        keep_alive="30m",
-        options=model_options,
-    )
+    if not CLOUD_MODE:
+        yield from ollama.chat(
+            model=local_model,
+            messages=messages,
+            stream=True,
+            keep_alive="30m",
+            options=model_options,
+        )
+        return
+
+    if errors:
+        raise RuntimeError("; ".join(errors)[-900:])
+    raise RuntimeError("No cloud AI provider is configured.")
 
 
 # =========================================================
@@ -1585,6 +1771,91 @@ if not st.session_state.messages:
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         render_chat_content(msg["content"])
+
+# ChatGPT-like jump-to-latest control. The small component installs the button
+# in the parent Streamlit page so it can stay fixed above the composer and keep
+# working while streamed Markdown grows.
+components.html(
+    """
+    <script>
+    (() => {
+      const w = window.parent;
+      const d = w.document;
+      const previous = w.__novaJumpToLatest;
+      if (previous) {
+        previous.cleanup();
+      }
+
+      const scroller = d.querySelector('[data-testid="stMain"]') ||
+                       d.scrollingElement || d.documentElement;
+      const button = d.createElement('button');
+      button.id = 'nova-jump-latest';
+      button.type = 'button';
+      button.setAttribute('aria-label', 'Jump to latest message');
+      button.title = 'Jump to latest message';
+      button.textContent = '↓';
+      Object.assign(button.style, {
+        position: 'fixed',
+        left: 'calc(50% + 115px)',
+        bottom: '108px',
+        transform: 'translateX(-50%)',
+        width: '38px',
+        height: '38px',
+        borderRadius: '999px',
+        border: '1px solid #d8d8dc',
+        background: '#ffffff',
+        color: '#333333',
+        fontSize: '22px',
+        lineHeight: '34px',
+        cursor: 'pointer',
+        zIndex: '999999',
+        boxShadow: '0 2px 10px rgba(0,0,0,.12)',
+        display: 'none'
+      });
+
+      const mobile = w.matchMedia('(max-width: 768px)');
+      const placeButton = () => {
+        button.style.left = mobile.matches ? '50%' : 'calc(50% + 115px)';
+        button.style.bottom = mobile.matches ? '142px' : '108px';
+      };
+      placeButton();
+
+      const distanceFromBottom = () =>
+        Math.max(0, scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight);
+
+      const refresh = () => {
+        const hasConversation = d.querySelectorAll('[data-testid="stChatMessage"]').length > 0;
+        button.style.display = hasConversation && distanceFromBottom() > 180
+          ? 'block' : 'none';
+      };
+
+      const jump = () => {
+        scroller.scrollTo({top: scroller.scrollHeight, behavior: 'smooth'});
+        w.setTimeout(refresh, 350);
+      };
+
+      button.addEventListener('click', jump);
+      scroller.addEventListener('scroll', refresh, {passive: true});
+      mobile.addEventListener('change', placeButton);
+      const observer = new MutationObserver(refresh);
+      observer.observe(d.body, {childList: true, subtree: true, characterData: true});
+      d.body.appendChild(button);
+      refresh();
+
+      w.__novaJumpToLatest = {
+        cleanup: () => {
+          observer.disconnect();
+          scroller.removeEventListener('scroll', refresh);
+          mobile.removeEventListener('change', placeButton);
+          button.remove();
+        }
+      };
+    })();
+    </script>
+    """,
+    height=0,
+    width=0,
+)
 
 if (
     st.session_state.generated_pdf
@@ -1754,6 +2025,33 @@ if prompt:
                 except Exception as e:
                     answer = f"Image search is unavailable right now: {e}"
                     st.error(answer)
+
+        save_message(st.session_state.chat_id, "assistant", answer)
+        st.session_state.messages.append(
+            {"role": "assistant", "content": answer}
+        )
+        st.rerun()
+
+    # Current weather is a deterministic tool call. It does not consume the
+    # shared Gemini quota, so it remains reliable when several people use Nova.
+    if wants_weather(prompt):
+        with st.chat_message("assistant"):
+            if not use_internet:
+                answer = (
+                    "Please turn on the Internet toggle to get live weather."
+                )
+                st.info(answer)
+            else:
+                try:
+                    with st.spinner("Checking live weather..."):
+                        answer = get_live_weather(prompt)
+                    st.markdown(answer)
+                except Exception as exc:
+                    answer = (
+                        "I couldn't fetch live weather right now. Please try "
+                        f"again shortly. ({html.escape(str(exc))[:180]})"
+                    )
+                    st.warning(answer)
 
         save_message(st.session_state.chat_id, "assistant", answer)
         st.session_state.messages.append(
@@ -2029,6 +2327,7 @@ The application will privately convert your output into a real PDF.
             "Cross-check the number and definition before answering."
         )
 
+    results = ""
     if web_needed:
         results = web_search(web_query)
 
@@ -2158,25 +2457,14 @@ FACT-CHECKING REQUIREMENT:
                 elif pdf_mode != "content":
                     placeholder.markdown(answer + "▌")
 
-            # Never leave a user message unanswered. Some free-tier streaming
-            # calls occasionally finish without a text part; retry once using
-            # the same context and then surface a clear error if still empty.
+            # Provider-level retries and alternate models are already handled
+            # inside stream_nova_chat. A second full call here would only burn
+            # more of the shared free-tier quota.
             if not answer.strip():
-                placeholder.markdown("Retrying response…")
-                retry_stream = stream_nova_chat(
-                    local_model=model,
-                    messages=nova_messages,
-                    model_options=model_options,
-                )
-                for chunk in retry_stream:
-                    piece = chunk.get("message", {}).get("content", "")
-                    answer += piece
-                    if piece and pdf_mode != "content":
-                        placeholder.markdown(answer + "▌")
-                if not answer.strip():
+                answer = build_search_fallback(web_query, results)
+                if not answer:
                     raise RuntimeError(
-                        "Gemini returned an empty response twice. Please "
-                        "retry after a minute or check the free-tier quota."
+                        "All configured AI providers are temporarily busy."
                     )
 
             if pdf_mode == "content":
@@ -2227,10 +2515,32 @@ FACT-CHECKING REQUIREMENT:
                 )
 
         except Exception as e:
-            if GEMINI_API_KEY:
+            fallback_answer = (
+                build_search_fallback(web_query, results)
+                if web_needed and pdf_mode != "content"
+                else ""
+            )
+            if fallback_answer:
+                placeholder.markdown(fallback_answer)
+                save_message(
+                    st.session_state.chat_id,
+                    "assistant",
+                    fallback_answer,
+                )
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": fallback_answer}
+                )
+            elif GEMINI_API_KEY:
                 error_message = (
-                    "❌ Nova could not reach Gemini. "
-                    + html.escape(str(e))[:700]
+                    "❌ Nova is temporarily busy because the shared free "
+                    "AI quota is full. Please retry in a minute."
+                )
+                placeholder.error(error_message)
+                save_message(
+                    st.session_state.chat_id, "assistant", error_message
+                )
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": error_message}
                 )
             elif OPENROUTER_API_KEY:
                 error_message = (
@@ -2238,20 +2548,22 @@ FACT-CHECKING REQUIREMENT:
                     "OpenRouter key, balance, and model access in your "
                     "deployment settings."
                 )
+                placeholder.error(error_message)
+                save_message(
+                    st.session_state.chat_id, "assistant", error_message
+                )
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": error_message}
+                )
             else:
                 error_message = f"❌ Error: {e}"
-            placeholder.error(error_message)
-            save_message(
-                st.session_state.chat_id,
-                "assistant",
-                error_message,
-            )
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": error_message
-                }
-            )
+                placeholder.error(error_message)
+                save_message(
+                    st.session_state.chat_id, "assistant", error_message
+                )
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": error_message}
+                )
 
     # Re-render once after completion. This removes the temporary new-chat
     # layout and leaves the finished conversation in the compact chat view.
