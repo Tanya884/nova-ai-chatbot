@@ -1365,9 +1365,14 @@ IMAGE_RESULT_PREFIX = "[[NOVA_IMAGE_RESULTS]]"
 GENERATED_IMAGE_PREFIX = "[[NOVA_GENERATED_IMAGE]]"
 
 
-def pack_image_results(query, images):
+def pack_image_results(query, images, clean_gallery=False):
     return IMAGE_RESULT_PREFIX + json.dumps(
-        {"query": query, "images": images}, ensure_ascii=False
+        {
+            "query": query,
+            "images": images,
+            "clean_gallery": clean_gallery,
+        },
+        ensure_ascii=False,
     )
 
 
@@ -1434,6 +1439,7 @@ def render_chat_content(content):
     try:
         payload = json.loads(content[len(IMAGE_RESULT_PREFIX):])
         images = payload.get("images", [])
+        clean_gallery = bool(payload.get("clean_gallery"))
         st.markdown(f"Here are pictures for **{payload.get('query', 'your search')}**:")
         for start in range(0, len(images), 3):
             columns = st.columns(3)
@@ -1443,12 +1449,13 @@ def render_chat_content(content):
                         item.get("thumbnail") or item["image"],
                         use_container_width=True,
                     )
-                    title = item.get("title", "View image")
-                    source = item.get("source", "")
-                    if source:
-                        st.markdown(f"[{title}]({source})")
-                    else:
-                        st.caption(title)
+                    if not clean_gallery:
+                        title = item.get("title", "View image")
+                        source = item.get("source", "")
+                        if source:
+                            st.markdown(f"[{title}]({source})")
+                        else:
+                            st.caption(title)
     except Exception:
         st.error("These image results could not be displayed.")
 
@@ -2191,30 +2198,39 @@ if prompt:
             if not use_internet:
                 answer = "Please turn on the Internet toggle to use images."
                 st.info(answer)
-            elif wants_image_generation(prompt) or not wants_image_search(prompt):
+            elif wants_image_generation(prompt) and POLLINATIONS_API_KEY:
                 try:
                     with st.spinner("Generating your image..."):
                         image_prompt, image_path = generate_ai_image(prompt)
                     answer = pack_generated_image(image_prompt, image_path)
                     render_chat_content(answer)
-                except Exception as e:
-                    answer = (
-                        "Image generation is temporarily unavailable. Please "
-                        f"try again shortly. ({html.escape(str(e))[:180]})"
-                    )
-                    st.error(answer)
+                except Exception:
+                    # Never expose provider URLs/authentication failures. Give
+                    # the user a useful clean gallery when generation is busy.
+                    with st.spinner("Finding the closest matching pictures..."):
+                        found_images = image_search(prompt)
+                    if found_images:
+                        answer = pack_image_results(
+                            prompt, found_images, clean_gallery=True
+                        )
+                        render_chat_content(answer)
+                    else:
+                        answer = "I couldn't create or find a usable image right now."
+                        st.warning(answer)
             else:
                 try:
                     with st.spinner("Finding pictures..."):
                         found_images = image_search(prompt)
                     if found_images:
-                        answer = pack_image_results(prompt, found_images)
+                        answer = pack_image_results(
+                            prompt, found_images, clean_gallery=True
+                        )
                         render_chat_content(answer)
                     else:
                         answer = "I couldn't find usable image results for that search."
                         st.warning(answer)
-                except Exception as e:
-                    answer = f"Image search is unavailable right now: {e}"
+                except Exception:
+                    answer = "Image search is temporarily unavailable. Please retry shortly."
                     st.error(answer)
 
         save_message(st.session_state.chat_id, "assistant", answer)
